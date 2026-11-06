@@ -14,6 +14,9 @@
 // You should have received a copy of the GNU General Public License
 // along with Moodle.  If not, see <http://www.gnu.org/licenses/>.
 
+use mod_adaptivequiz\attempt as read_attempt;
+use mod_adaptivequiz\local\attempt as attempt_entity;
+
 /**
  * Generator for the module.
  *
@@ -28,11 +31,12 @@ class mod_adaptivequiz_generator extends testing_module_generator {
      * Creates new module instance.
      *
      * For params description see the parent's method.
+     * IMPORTANT: do not throw any exceptions on missing data, as this method may be called by Moodle's core tests. Try to
+     * find a proper default value for each property.
      *
      * @param array|stdClass|null $record
      * @param array|null $options
      * @return stdClass
-     * @throws coding_exception
      */
     public function create_instance($record = null, array $options = null) {
         global $CFG;
@@ -42,8 +46,11 @@ class mod_adaptivequiz_generator extends testing_module_generator {
         $record = (object)(array)$record;
 
         if (!isset($record->questionpool) && !isset($record->questionpoolnamed)) {
-            throw new coding_exception('either \'questionpool\' or \'questionpoolnamed\' property must be specified when '.
-                'generating an adaptive quiz instance');
+            $context = context_course::instance($record->course);
+            $questioncat = question_get_top_category($context->id, $create = true);
+            $record->questionpool = [
+                $questioncat->id,
+            ];
         }
 
         // Named question pool takes precedence over the 'questionpool' setting.
@@ -61,8 +68,11 @@ class mod_adaptivequiz_generator extends testing_module_generator {
             'attempts' => 0,
             'grademethod' => ADAPTIVEQUIZ_GRADEHIGHEST,
             'password' => '',
+            'attemptfeedbackenable' => 0,
             'attemptfeedback' => '',
             'attemptfeedbackformat' => FORMAT_MOODLE,
+            'showabilitymeasurefeedback' => 0,
+            'showabilitymeasuresummary' => 0,
             'attemptonlast' => 0,
             'highestlevel' => 111,
             'lowestlevel' => 1,
@@ -81,6 +91,77 @@ class mod_adaptivequiz_generator extends testing_module_generator {
         }
 
         return parent::create_instance($record, $options);
+    }
+
+    /**
+     * Generates a 'fresh' attempt for user.
+     *
+     * Note, that this runs the entire logic of starting an attempt, etc. This means it's assumed that the adaptive quiz instance
+     * is set up with a proper questions pool containing a minimal number of actual questions, etc.
+     *
+     * @param int $userid
+     * @param int $adaptivequizid
+     * @param context_module $context
+     */
+    public function create_in_progress_attempt(int $userid, int $adaptivequizid, context_module $context): read_attempt {
+        global $DB;
+
+        $adaptivequiz = $DB->get_record('adaptivequiz', ['id' => $adaptivequizid], '*', MUST_EXIST);
+
+        $adaptivequizforattempt = clone($adaptivequiz);
+        $adaptivequizforattempt->context = $context;
+
+        $attempt = new attempt_entity($adaptivequizforattempt, $userid);
+        $attempt->set_level($adaptivequiz->startinglevel);
+        $attempt->start_attempt();
+
+        $uniqueid = $attempt->get_quba()->get_id();
+
+        return read_attempt::get_record(['uniqueid' => $uniqueid], MUST_EXIST);
+    }
+
+    /**
+     * Generates a completed attempt for user.
+     *
+     * The note from {@see self::create_in_progress_attempt()} is applicable here as well.
+     *
+     * @param int $userid
+     * @param int $adaptivequizid
+     * @param context_module $context
+     * @param array $attemptdata Raw values for the following fields can be passed: 'standarderror', 'measure'.
+     * @param string $stoppagereason
+     */
+    public function create_completed_attempt(
+        int $userid,
+        int $adaptivequizid,
+        context_module $context,
+        array $attemptdata,
+        string $stoppagereason
+    ): read_attempt {
+        global $DB;
+
+        $adaptivequiz = $DB->get_record('adaptivequiz', ['id' => $adaptivequizid], '*', MUST_EXIST);
+
+        $adaptivequizforattempt = clone($adaptivequiz);
+        $adaptivequizforattempt->context = $context;
+
+        $attempt = new attempt_entity($adaptivequizforattempt, $userid);
+        $attempt->set_level($adaptivequiz->startinglevel);
+        $attempt->start_attempt();
+
+        $uniqueid = $attempt->get_quba()->get_id();
+
+        $standarderror = array_key_exists('standarderror', $attemptdata) ? $attemptdata['standarderror'] : 0.0;
+
+        if (array_key_exists('measure', $attemptdata)) {
+            adaptivequiz_update_attempt_data($uniqueid, $adaptivequizid, $userid, $difflogit = 0, $standarderror,
+                $attemptdata['measure']);
+        }
+
+        adaptivequiz_complete_attempt(uniqueid: $uniqueid, adaptivequiz: $adaptivequiz, context: $context, userid: $userid,
+            standarderror: $standarderror, statusmessage: $stoppagereason);
+
+        return read_attempt::get_record(['uniqueid' => $uniqueid], MUST_EXIST);
     }
 
     /**
